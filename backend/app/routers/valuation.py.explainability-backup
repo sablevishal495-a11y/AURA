@@ -1,0 +1,165 @@
+from pathlib import Path
+import os
+
+import joblib
+import pandas as pd
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+router = APIRouter(prefix="/api/valuation", tags=["Valuation"])
+
+MODEL_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "ml"
+    / "artifacts"
+    / "property_valuation_model.joblib"
+)
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://aura_user:aura_dev_password@localhost:5432/aura"
+)
+engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+
+try:
+    artifact = joblib.load(MODEL_PATH)
+    model = artifact["model"]
+    FEATURES = artifact["features"]
+    METRICS = artifact["metrics"]
+except Exception as exc:
+    model = None
+    FEATURES = []
+    METRICS = {}
+    print(f"Could not load valuation model: {exc}")
+
+
+class ValuationRequest(BaseModel):
+    city: str
+    locality: str
+    property_type: str = "Apartment"
+    area_sqft: float = Field(gt=0)
+    bedrooms: int = Field(ge=0)
+    bathrooms: int = Field(ge=0, default=1)
+    property_age_years: int = Field(ge=0, default=0)
+    floor_number: int = Field(ge=0, default=0)
+    furnishing_status: str = "Unfurnished"
+
+
+@router.post("/")
+async def estimate_valuation(request: ValuationRequest):
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Valuation model is not available. Check the model artifact.",
+        )
+
+    property_data = request.model_dump()
+    input_df = pd.DataFrame([property_data], columns=FEATURES)
+
+    try:
+        predicted_value = float(model.predict(input_df)[0])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Valuation prediction failed: {str(exc)}",
+        )
+
+    mae = float(METRICS.get("mae", 0))
+    low_estimate = max(0, predicted_value - mae)
+    high_estimate = predicted_value + mae
+
+    # Fetch comparable records for the same city, locality and property type.
+    comparable_query = text("""
+        SELECT
+            city,
+            locality,
+            property_type,
+            area_sqft,
+            transaction_value_inr,
+            rate_per_sqft_inr,
+            data_source,
+            is_verified
+        FROM property_comparables
+        WHERE LOWER(city) = LOWER(:city)
+          AND LOWER(locality) = LOWER(:locality)
+          AND LOWER(property_type) = LOWER(:property_type)
+          AND area_sqft > 0
+          AND transaction_value_inr > 0
+        ORDER BY comparable_id DESC
+        LIMIT 10
+    """)
+
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            comparable_query,
+            {
+                "city": request.city,
+                "locality": request.locality,
+                "property_type": request.property_type,
+            },
+        )
+        comparable_rows = result.mappings().all()
+
+    comparables = []
+    for row in comparable_rows:
+        comparables.append({
+            "city": row["city"],
+            "locality": row["locality"],
+            "property_type": row["property_type"],
+            "area_sqft": row["area_sqft"],
+            "transaction_value_inr": row["transaction_value_inr"],
+            "rate_per_sqft_inr": row["rate_per_sqft_inr"],
+            "data_source": row["data_source"],
+            "is_verified": row["is_verified"],
+        })
+
+    comparable_count = len(comparables)
+
+    if comparable_count:
+        average_rate = sum(
+            float(item["rate_per_sqft_inr"]) for item in comparables
+        ) / comparable_count
+
+        comparable_estimate = average_rate * request.area_sqft
+    else:
+        average_rate = None
+        comparable_estimate = None
+
+    return {
+        "estimated_value_inr": round(predicted_value, 2),
+        "low_estimate_inr": round(low_estimate, 2),
+        "high_estimate_inr": round(high_estimate, 2),
+        "model": "LightGBM",
+        "data_source": artifact.get("data_source", "UNKNOWN"),
+        "evaluation_metrics": {
+            "mae_inr": round(mae, 2),
+            "rmse_inr": round(float(METRICS.get("rmse", 0)), 2),
+            "r2": round(float(METRICS.get("r2", 0)), 4),
+            "evaluation_data": "Synthetic demo data",
+        },
+        "comparable_insights": {
+            "comparable_count": comparable_count,
+            "average_rate_per_sqft_inr": (
+                round(average_rate, 2) if average_rate is not None else None
+            ),
+            "comparable_estimate_inr": (
+                round(comparable_estimate, 2)
+                if comparable_estimate is not None
+                else None
+            ),
+            "records": comparables,
+            "notice": (
+                "Comparable records are imported demo data and may be unverified."
+                if comparable_count
+                else "No matching comparable records found for this location and property type."
+            ),
+        },
+        "disclaimer": (
+            "Demo estimate trained on synthetic data. "
+            "Comparable records are not necessarily verified transactions. "
+            "Not a verified market valuation or lending decision. "
+            "The displayed range is illustrative, not a calibrated confidence interval."
+        ),
+    }

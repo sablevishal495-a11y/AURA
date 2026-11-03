@@ -1,0 +1,83 @@
+from pathlib import Path
+
+import joblib
+import pandas as pd
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+router = APIRouter(prefix="/api/valuation", tags=["Valuation"])
+
+MODEL_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "ml"
+    / "artifacts"
+    / "property_valuation_model.joblib"
+)
+
+try:
+    artifact = joblib.load(MODEL_PATH)
+    model = artifact["model"]
+    FEATURES = artifact["features"]
+    METRICS = artifact["metrics"]
+except Exception as exc:
+    model = None
+    FEATURES = []
+    METRICS = {}
+    print(f"Could not load valuation model: {exc}")
+
+
+class ValuationRequest(BaseModel):
+    city: str
+    locality: str
+    property_type: str = "Apartment"
+    area_sqft: float = Field(gt=0)
+    bedrooms: int = Field(ge=0)
+    bathrooms: int = Field(ge=0, default=1)
+    property_age_years: int = Field(ge=0, default=0)
+    floor_number: int = Field(ge=0, default=0)
+    furnishing_status: str = "Unfurnished"
+
+
+@router.post("/")
+def estimate_valuation(request: ValuationRequest):
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Valuation model is not available. Check the model artifact.",
+        )
+
+    property_data = request.model_dump()
+    input_df = pd.DataFrame([property_data], columns=FEATURES)
+
+    try:
+        predicted_value = float(model.predict(input_df)[0])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Valuation prediction failed: {str(exc)}",
+        )
+
+    # Illustrative range based on synthetic-test MAE.
+    # This is NOT a calibrated confidence interval.
+    mae = float(METRICS.get("mae", 0))
+    low_estimate = max(0, predicted_value - mae)
+    high_estimate = predicted_value + mae
+
+    return {
+        "estimated_value_inr": round(predicted_value, 2),
+        "low_estimate_inr": round(low_estimate, 2),
+        "high_estimate_inr": round(high_estimate, 2),
+        "model": "LightGBM",
+        "data_source": artifact.get("data_source", "UNKNOWN"),
+        "evaluation_metrics": {
+            "mae_inr": round(mae, 2),
+            "rmse_inr": round(float(METRICS.get("rmse", 0)), 2),
+            "r2": round(float(METRICS.get("r2", 0)), 4),
+            "evaluation_data": "Synthetic demo data",
+        },
+        "disclaimer": (
+            "Demo estimate trained on synthetic data. "
+            "Not a verified market valuation or lending decision. "
+            "The displayed range is illustrative, not a calibrated confidence interval."
+        ),
+    }

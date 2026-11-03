@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: aura-db
+    environment:
+      POSTGRES_DB: aura
+      POSTGRES_USER: aura_user
+      POSTGRES_PASSWORD: aura_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - aura_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aura_user -d aura"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    container_name: aura-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aura_user:aura_dev_password@db:5432/aura
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  aura_postgres_data:
