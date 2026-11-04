@@ -50,16 +50,17 @@ except Exception as exc:
 
 
 class ValuationRequest(BaseModel):
-    city: str
-    locality: str
-    property_type: str = "Apartment"
-    area_sqft: float = Field(gt=0)
-    bedrooms: int = Field(ge=0)
-    bathrooms: int = Field(ge=0, default=1)
-    property_age_years: int = Field(ge=0, default=0)
-    floor_number: int = Field(ge=0, default=0)
-    furnishing_status: str = "Unfurnished"
+    city: str = Field(min_length=1, max_length=100)
+    locality: str = Field(min_length=1, max_length=100)
+    property_type: str = Field(default="Apartment", min_length=1, max_length=50)
 
+    area_sqft: float = Field(gt=0, le=50000)
+    bedrooms: int = Field(ge=0, le=20)
+    bathrooms: int = Field(ge=0, le=20, default=1)
+    property_age_years: int = Field(ge=0, le=100, default=0)
+    floor_number: int = Field(ge=0, le=200, default=0)
+
+    furnishing_status: str = Field(default="Unfurnished", max_length=50)
 
 def get_shap_explanation(input_df: pd.DataFrame):
     """
@@ -157,7 +158,7 @@ def get_shap_explanation(input_df: pd.DataFrame):
             "method": "SHAP TreeExplainer",
             "available": False,
             "top_factors": [],
-            "notice": f"SHAP explanation failed: {str(exc)}",
+            "notice": "SHAP explanation is unavailable for this request. Check backend logs for details.",
         }
 
 
@@ -211,15 +212,20 @@ async def estimate_valuation(request: ValuationRequest):
     )
 
     async with engine.connect() as connection:
-        result = await connection.execute(
-            comparable_query,
-            {
-                "city": request.city,
-                "locality": request.locality,
-                "property_type": request.property_type,
-            },
-        )
-        comparable_rows = result.mappings().all()
+        try:
+            result = await connection.execute(
+                comparable_query,
+                {
+                    "city": request.city,
+                    "locality": request.locality,
+                    "property_type": request.property_type,
+                },
+            )
+            comparable_rows = result.mappings().all()
+        except Exception as exc:
+            # A model estimate can still be returned when comparable evidence is unavailable.
+            print(f"Comparable lookup failed: {exc}")
+            comparable_rows = []
 
     comparables = []
 
@@ -273,10 +279,34 @@ async def estimate_valuation(request: ValuationRequest):
         verified_count = 0
         evidence_quality = "Unavailable"
 
+    # Transparent, rule-based evidence score for demo triage. This is NOT
+    # a calibrated probability that the valuation is correct.
+    verified_ratio = (verified_count / comparable_count) if comparable_count else 0.0
+    evidence_score = min(100, round(
+        min(verified_count, 5) * 12
+        + min(comparable_count, 10) * 3
+        + verified_ratio * 10,
+    ))
+
+    source_is_synthetic = str(artifact.get("data_source", "")).upper() == "SYNTHETIC_DEMO"
+    if source_is_synthetic:
+        triage_status = "DEMO_ONLY_MANUAL_REVIEW"
+        triage_reason = "Model is trained on synthetic demo data; do not rely on this estimate for lending."
+    elif verified_count < 3:
+        triage_status = "PHYSICAL_VALUATION_RECOMMENDED"
+        triage_reason = "Fewer than 3 verified comparable records are available."
+    elif evidence_score < 60:
+        triage_status = "PHYSICAL_VALUATION_RECOMMENDED"
+        triage_reason = "Evidence score is below the demo desk-review threshold."
+    else:
+        triage_status = "DESK_REVIEW_CANDIDATE"
+        triage_reason = "Evidence meets the demo rule threshold; human reviewer must validate before lending use."
+
     return {
         "estimated_value_inr": round(predicted_value, 2),
         "low_estimate_inr": round(low_estimate, 2),
         "high_estimate_inr": round(high_estimate, 2),
+        "estimate_range_method": "Illustrative model MAE band; not a calibrated prediction interval",
         "model": "LightGBM",
         "data_source": artifact.get("data_source", "UNKNOWN"),
 
@@ -319,6 +349,20 @@ async def estimate_valuation(request: ValuationRequest):
                 "Evidence quality is a simple demo indicator based on comparable "
                 "record verification and count. It is not a calibrated confidence score."
             ),
+        },
+
+        "evidence_assessment": {
+            "score": evidence_score,
+            "label": ("Strong demo evidence" if evidence_score >= 75 else "Moderate demo evidence" if evidence_score >= 40 else "Limited demo evidence"),
+            "components": {
+                "verified_comparables": verified_count,
+                "total_matching_comparables": comparable_count,
+                "verified_share": round(verified_ratio, 2),
+            },
+            "triage_status": triage_status,
+            "triage_reason": triage_reason,
+            "human_review_required": True,
+            "method": "Rule-based demonstration score; not statistically calibrated and not a credit decision.",
         },
 
         "comparable_insights": {

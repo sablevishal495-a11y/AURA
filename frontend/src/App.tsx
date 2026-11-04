@@ -41,6 +41,8 @@ type ValuationResult = {
     notice: string
   }
   disclaimer: string
+  evidence_quality: { quality: 'Higher' | 'Moderate' | 'Low' | 'Unavailable'; comparable_count: number; verified_comparable_count: number; notice: string }
+  evidence_assessment: { score: number; label: string; components: { verified_comparables: number; total_matching_comparables: number; verified_share: number }; triage_status: string; triage_reason: string; human_review_required: boolean; method: string }
 }
 
 function App() {
@@ -62,6 +64,9 @@ function App() {
   const [valuation, setValuation] = useState<ValuationResult | null>(null)
   const [valuationLoading, setValuationLoading] = useState(false)
   const [valuationError, setValuationError] = useState('')
+  const [reviewLoading, setReviewLoading] = useState(false)
+  const [reviewResult, setReviewResult] = useState<{ review_id: string; review_status: string; routing_reason: string; human_review_required: boolean; notice: string } | null>(null)
+  const [reviewError, setReviewError] = useState('')
 
   useEffect(() => {
     const params = new URLSearchParams({ limit: '50' })
@@ -91,51 +96,111 @@ function App() {
       })
   }, [city])
 
-  const formatPrice = (value: number) =>
+   const formatPrice = (value: number) =>
     new Intl.NumberFormat('en-IN', {
       style: 'currency',
       currency: 'INR',
       maximumFractionDigits: 0,
     }).format(value)
 
-  const handleValuation = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    setValuationLoading(true)
-    setValuationError('')
-    setValuation(null)
+const handleValuation = async (event: React.FormEvent<HTMLFormElement>) => {
+  event.preventDefault()
+  setValuationError('')
+  setValuation(null)
+  setReviewResult(null)
+  setReviewError('')
 
-    try {
-      const response = await fetch('http://localhost:8000/api/valuation/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...valuationForm,
-          area_sqft: Number(valuationForm.area_sqft),
-          bedrooms: Number(valuationForm.bedrooms),
-          property_age_years: Number(valuationForm.property_age_years),
-        }),
-      })
 
-      if (!response.ok) {
-const result = await response.json()
+  const area = Number(valuationForm.area_sqft)
+  const bedrooms = Number(valuationForm.bedrooms)
+  const age = Number(valuationForm.property_age_years)
 
-const message = Array.isArray(result.detail)
-  ? result.detail.map((item: { msg: string }) => item.msg).join(', ')
-  : result.detail || 'Valuation request failed'
-
-throw new Error(message)
-      }
-
-      const result: ValuationResult = await response.json()
-      setValuation(result)
-    } catch (err) {
-      setValuationError(
-        err instanceof Error ? err.message : 'Could not connect to valuation API.',
-      )
-    } finally {
-      setValuationLoading(false)
-    }
+  // Validate text fields
+  if (!valuationForm.city.trim() || !valuationForm.locality.trim()) {
+    setValuationError('Please enter both city and locality.')
+    return
   }
+
+  // Validate numeric fields
+  if (!Number.isFinite(area) || area < 100 || area > 50000) {
+    setValuationError('Area must be between 100 and 50,000 sq. ft.')
+    return
+  }
+
+  if (!Number.isInteger(bedrooms) || bedrooms < 0 || bedrooms > 20) {
+    setValuationError('Bedrooms must be a whole number between 0 and 20.')
+    return
+  }
+
+  if (!Number.isFinite(age) || age < 0 || age > 100) {
+    setValuationError('Property age must be between 0 and 100 years.')
+    return
+  }
+
+  setValuationLoading(true)
+
+  try {
+    const response = await fetch('http://localhost:8000/api/valuation/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...valuationForm,
+        area_sqft: area,
+        bedrooms,
+        property_age_years: age,
+      }),
+    })
+
+    if (!response.ok) {
+      const result = await response.json()
+
+      const message = Array.isArray(result.detail)
+        ? result.detail.map((item: { msg: string }) => item.msg).join(', ')
+        : result.detail || 'Valuation request failed'
+
+      throw new Error(message)
+    }
+
+    const result: ValuationResult = await response.json()
+    setValuation(result)
+  } catch (err) {
+    setValuationError(
+      err instanceof Error ? err.message : 'Could not connect to valuation API.',
+    )
+  } finally {
+    setValuationLoading(false)
+  }
+}
+
+const handleCreateLenderReview = async () => {
+  if (!valuation) return
+  setReviewLoading(true)
+  setReviewError('')
+  setReviewResult(null)
+  try {
+    const response = await fetch('http://localhost:8000/api/lender-review/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        property_input: { ...valuationForm, area_sqft: Number(valuationForm.area_sqft), bedrooms: Number(valuationForm.bedrooms), property_age_years: Number(valuationForm.property_age_years) },
+        estimated_value_inr: valuation.estimated_value_inr,
+        low_estimate_inr: valuation.low_estimate_inr,
+        high_estimate_inr: valuation.high_estimate_inr,
+        data_source: valuation.data_source,
+        comparable_count: valuation.evidence_quality.comparable_count,
+        verified_comparable_count: valuation.evidence_quality.verified_comparable_count,
+        evidence_quality: valuation.evidence_quality.quality,
+      }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.detail || 'Could not create lender review.')
+    setReviewResult(result)
+  } catch (err) {
+    setReviewError(err instanceof Error ? err.message : 'Lender review request failed.')
+  } finally {
+    setReviewLoading(false)
+  }
+}
 
   return (
     <div className="app-shell">
@@ -249,7 +314,7 @@ throw new Error(message)
               </div>
             </div>
 
-            <form className="valuation-form" onSubmit={handleValuation}>
+            <form className="valuation-form" onSubmit={handleValuation} noValidate>
               <label>
                 City
                 <select
@@ -292,7 +357,9 @@ throw new Error(message)
                 Area (sq. ft.)
                 <input
                   type="number"
-                  min="1"
+                  min="500"
+                  max="50000"
+                  step="1"
                   required
                   value={valuationForm.area_sqft}
                   onChange={(e) => setValuationForm({ ...valuationForm, area_sqft: e.target.value })}
@@ -304,6 +371,8 @@ throw new Error(message)
                 <input
                   type="number"
                   min="0"
+                  max="20"
+                  step="1"
                   required
                   value={valuationForm.bedrooms}
                   onChange={(e) => setValuationForm({ ...valuationForm, bedrooms: e.target.value })}
@@ -315,6 +384,8 @@ throw new Error(message)
                 <input
                   type="number"
                   min="0"
+                  max="40"
+                  step="1"
                   required
                   value={valuationForm.property_age_years}
                   onChange={(e) => setValuationForm({ ...valuationForm, property_age_years: e.target.value })}
@@ -362,6 +433,20 @@ throw new Error(message)
       </p>
     </div>
 
+    {valuation.evidence_assessment && (
+      <div className="comparable-section evidence-assessment">
+        <h3>Evidence Assessment & Lender Triage</h3>
+        <div className="comparable-stats">
+          <div><small>Evidence score (demo)</small><strong>{valuation.evidence_assessment.score}/100</strong></div>
+          <div><small>Evidence label</small><strong>{valuation.evidence_assessment.label}</strong></div>
+          <div><small>Verified comparables</small><strong>{valuation.evidence_assessment.components.verified_comparables} / {valuation.evidence_assessment.components.total_matching_comparables}</strong></div>
+        </div>
+        <p><strong>{valuation.evidence_assessment.triage_status.replaceAll('_', ' ')}</strong></p>
+        <p className="valuation-notice">{valuation.evidence_assessment.triage_reason}</p>
+        <p className="valuation-notice">{valuation.evidence_assessment.method}</p>
+      </div>
+    )}
+
     {valuation.comparable_insights && (
   <div className="comparable-section">
     <h3>Comparable Property Evidence</h3>
@@ -398,6 +483,22 @@ throw new Error(message)
     <p className="valuation-notice">
       {valuation.comparable_insights.notice}
     </p>
+
+    <div className="lender-review-action">
+      <button type="button" className="valuation-submit" onClick={handleCreateLenderReview} disabled={reviewLoading}>
+        {reviewLoading ? 'Creating lender review...' : 'Create Lender Review Record'}
+      </button>
+      <p className="valuation-notice">Creates an auditable review record. It does not approve or decline a loan.</p>
+      {reviewError && <p className="error-message">{reviewError}</p>}
+      {reviewResult && (
+        <div className="review-result-card">
+          <strong>{reviewResult.review_status.replaceAll('_', ' ')}</strong>
+          <p>{reviewResult.routing_reason}</p>
+          <small>Review ID: {reviewResult.review_id}</small>
+          <p>{reviewResult.notice}</p>
+        </div>
+      )}
+    </div>
 
     {valuation.comparable_insights.records.length > 0 && (
       <div className="comparable-list">
